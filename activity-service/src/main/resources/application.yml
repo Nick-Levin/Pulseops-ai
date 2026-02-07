@@ -1,0 +1,54 @@
+server:
+  port: 8084
+
+spring:
+  application:
+    name: activity-service
+
+  data:
+    mongodb:
+      uri: mongodb://pulseops:pulseops_secret@localhost:27017/pulseops-activity
+      auto-index-creation: true
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: activity-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.pulseops.activity.messaging
+        spring.json.value.default.type: com.pulseops.activity.messaging.EventEnvelope
+    admin:
+      auto-create: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      service: ${spring.application.name}
+  otlp:
+    metrics:
+      export:
+        url: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/metrics
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+
+logging:
+  level:
+    com.pulseops.activity: INFO
+    org.springframework.kafka: WARN
+    org.springframework.data.mongodb: WARN
+
+pulseops:
+  kafka:
+    topic:
+      domain-events: pulseops.domain-events
+    consumer:
+      group-id: activity-service

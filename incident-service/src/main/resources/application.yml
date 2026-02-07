@@ -1,0 +1,53 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: incident-service
+
+  data:
+    mongodb:
+      uri: mongodb://pulseops:pulseops_secret@localhost:27017/pulseops-incidents
+      auto-index-creation: true
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+    admin:
+      auto-create: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      service: ${spring.application.name}
+  otlp:
+    metrics:
+      export:
+        url: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/metrics
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+
+logging:
+  level:
+    com.pulseops.incident: INFO
+    org.springframework.kafka: WARN
+
+pulseops:
+  kafka:
+    topic:
+      domain-events: pulseops.domain-events
+  incident:
+    stale:
+      threshold-minutes: 30
+      check-interval-ms: 300000  # 5 minutes

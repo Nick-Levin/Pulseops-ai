@@ -1,0 +1,406 @@
+version: "3.8"
+
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+
+  # MongoDB 7 - Data persistence for incidents, evidence metadata, activity, api_keys
+  mongodb:
+    image: mongo:7.0.5
+    container_name: pulseops-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: pulseops
+      MONGO_INITDB_ROOT_PASSWORD: pulseops_secret
+      MONGO_INITDB_DATABASE: pulseops
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pulseops-network
+
+  # MinIO - S3-compatible file storage for evidence files
+  minio:
+    image: minio/minio:RELEASE.2024-02-04T22-36-13Z
+    container_name: pulseops-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: pulseops
+      MINIO_ROOT_PASSWORD: pulseops_secret_key
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:9000/minio/health/live || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+      disable: false
+    networks:
+      - pulseops-network
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/minio:RELEASE.2024-02-04T22-36-13Z
+    container_name: pulseops-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: pulseops
+      MINIO_ROOT_PASSWORD: pulseops_secret_key
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 pulseops pulseops_secret_key &&
+        mc mb local/pulseops-evidence --ignore-existing &&
+        mc policy set public local/pulseops-evidence &&
+        echo 'Bucket pulseops-evidence created successfully'
+      "
+    networks:
+      - pulseops-network
+
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.3
+    container_name: pulseops-zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pulseops-network
+
+  # Kafka - Single broker for service-to-service messaging
+  kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: pulseops-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pulseops-network
+
+  # Kafka topic initialization
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: pulseops-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic pulseops.domain-events --partitions 3 --replication-factor 1 &&
+        echo 'Topic pulseops.domain-events created successfully'
+      "
+    networks:
+      - pulseops-network
+
+  # OpenTelemetry Collector - Receives traces via OTLP HTTP
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.94.0
+    container_name: pulseops-otel-collector
+    restart: unless-stopped
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+      - "8889:8889"   # Prometheus exporter
+      - "13133:13133" # Health check
+    volumes:
+      - ./otel-config.yml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    depends_on:
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:13133"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - pulseops-network
+
+  # Jaeger - Trace visualization UI
+  jaeger:
+    image: jaegertracing/all-in-one:1.54.0
+    container_name: pulseops-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14250:14250"   # gRPC
+      - "14268:14268"   # HTTP
+      - "14269:14269"   # Admin
+      - "9411:9411"     # Zipkin
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:14269"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - pulseops-network
+
+  # ============================================
+  # BACKEND MICROSERVICES
+  # ============================================
+
+  # Secrets Service - API key management
+  secrets-service:
+    build:
+      context: ./secrets-service
+      dockerfile: Dockerfile
+    container_name: pulseops-secrets-service
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - SERVER_PORT=8081
+      - SPRING_DATA_MONGODB_URI=mongodb://pulseops:pulseops_secret@mongodb:27017/pulseops-secrets?authSource=admin
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=secrets-service
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=secrets-service,service.version=1.0.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pulseops-network
+
+  # Incident Service - Incident lifecycle management
+  incident-service:
+    build:
+      context: ./incident-service
+      dockerfile: Dockerfile
+    container_name: pulseops-incident-service
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      - SERVER_PORT=8082
+      - SPRING_DATA_MONGODB_URI=mongodb://pulseops:pulseops_secret@mongodb:27017/pulseops-incidents?authSource=admin
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=incident-service
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=incident-service,service.version=1.0.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8082/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pulseops-network
+
+  # Evidence Service - File upload/download
+  evidence-service:
+    build:
+      context: ./evidence-service
+      dockerfile: Dockerfile
+    container_name: pulseops-evidence-service
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      - SERVER_PORT=8083
+      - SPRING_DATA_MONGODB_URI=mongodb://pulseops:pulseops_secret@mongodb:27017/pulseops-evidence?authSource=admin
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=pulseops
+      - MINIO_SECRET_KEY=pulseops_secret_key
+      - MINIO_BUCKET=pulseops-evidence
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=evidence-service
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=evidence-service,service.version=1.0.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8083/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pulseops-network
+
+  # Activity Service - Activity feed and SSE streaming
+  activity-service:
+    build:
+      context: ./activity-service
+      dockerfile: Dockerfile
+    container_name: pulseops-activity-service
+    restart: unless-stopped
+    ports:
+      - "8084:8084"
+    environment:
+      - SERVER_PORT=8084
+      - SPRING_DATA_MONGODB_URI=mongodb://pulseops:pulseops_secret@mongodb:27017/pulseops-activity?authSource=admin
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=activity-service
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=activity-service,service.version=1.0.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8084/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pulseops-network
+
+  # Gateway Service - API Gateway
+  gateway-service:
+    build:
+      context: ./gateway-service
+      dockerfile: Dockerfile
+    container_name: pulseops-gateway-service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_PORT=8080
+      - SECRETS_SERVICE_URL=http://secrets-service:8081
+      - INCIDENT_SERVICE_URL=http://incident-service:8082
+      - EVIDENCE_SERVICE_URL=http://evidence-service:8083
+      - ACTIVITY_SERVICE_URL=http://activity-service:8084
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=gateway-service
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=gateway-service,service.version=1.0.0
+    depends_on:
+      secrets-service:
+        condition: service_healthy
+      incident-service:
+        condition: service_healthy
+      evidence-service:
+        condition: service_healthy
+      activity-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - pulseops-network
+
+  # ============================================
+  # FRONTEND
+  # ============================================
+
+  # Frontend - React application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pulseops-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8080
+    depends_on:
+      gateway-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pulseops-network
+
+volumes:
+  mongodb_data:
+    driver: local
+  minio_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  zookeeper_logs:
+    driver: local
+  kafka_data:
+    driver: local
+
+networks:
+  pulseops-network:
+    driver: bridge

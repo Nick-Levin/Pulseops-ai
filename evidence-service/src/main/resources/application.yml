@@ -1,0 +1,62 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: evidence-service
+
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+  data:
+    mongodb:
+      uri: mongodb://pulseops:pulseops_secret@localhost:27017/pulseops-evidence
+      auto-index-creation: true
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+    admin:
+      auto-create: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      service: ${spring.application.name}
+  otlp:
+    metrics:
+      export:
+        url: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/metrics
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+
+logging:
+  level:
+    com.pulseops.evidence: INFO
+    org.springframework.kafka: WARN
+    org.springframework.data.mongodb: WARN
+    io.minio: WARN
+
+minio:
+  endpoint: http://localhost:9000
+  access-key: pulseops
+  secret-key: pulseops_secret_key
+  bucket: pulseops-evidence
+
+pulseops:
+  kafka:
+    topic:
+      domain-events: pulseops.domain-events
